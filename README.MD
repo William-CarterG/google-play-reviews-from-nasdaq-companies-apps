@@ -30,12 +30,30 @@ GET /<SYMBOL>/reviews
 Example: `GET /AAPL/reviews`
 Returns all 2025 reviews for Apple's apps in JSON format.
 
-### 3. Download CSV file
+### 3. Download CSV file (single company)
 ```
 GET /<SYMBOL>/reviews/csv
 ```
 Example: `GET /AAPL/reviews/csv`
 Downloads a CSV file with all 2025 reviews for the company's apps.
+
+### 4. Download CSV file (ALL companies)
+```
+GET /all-companies/reviews/csv
+```
+Downloads a massive CSV with reviews from ALL NASDAQ-100 companies.
+⚠️ **Warning**: This will take 30+ minutes and make 100+ requests to Google Play Store.
+
+### 5. Download CSV file (batch of specific companies)
+```
+POST /batch/reviews/csv
+Content-Type: application/json
+
+{
+  "symbols": ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
+}
+```
+Downloads a CSV with reviews from only the specified companies.
 
 ## CSV Columns
 
@@ -54,7 +72,7 @@ The generated CSV will include:
 ## Example Usage
 
 ```bash
-# Get Apple's reviews as CSV
+# Get Apple's reviews as CSV (single company)
 curl "http://localhost:5000/AAPL/reviews/csv" -o apple_reviews_2025.csv
 
 # Get Microsoft's reviews in JSON
@@ -62,6 +80,15 @@ curl "http://localhost:5000/MSFT/reviews"
 
 # List all available companies
 curl "http://localhost:5000/companies"
+
+# Download ALL NASDAQ-100 companies' reviews (this will take a LONG time!)
+curl "http://localhost:5000/all-companies/reviews/csv" -o nasdaq_100_all_reviews_2025.csv
+
+# Download specific companies using batch endpoint
+curl -X POST "http://localhost:5000/batch/reviews/csv" \
+  -H "Content-Type: application/json" \
+  -d '{"symbols": ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]}' \
+  -o tech_giants_reviews_2025.csv
 ```
 
 ## Rate Limiting

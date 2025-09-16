@@ -154,7 +154,7 @@ class PlayStoreReviewsFetcher:
         return all_reviews
 
 # Initialize the fetcher
-fetcher = PlayStoreReviewsFetcher(rate_limit_delay=0)
+fetcher = PlayStoreReviewsFetcher(rate_limit_delay=1.5)
 
 @app.route('/')
 def home():
@@ -165,9 +165,15 @@ def home():
         "endpoints": {
             "/companies": "GET - List all available NASDAQ companies",
             "/<symbol>/reviews": "GET - Get reviews for a company's apps",
-            "/<symbol>/reviews/csv": "GET - Download CSV of company's app reviews"
+            "/<symbol>/reviews/csv": "GET - Download CSV of company's app reviews",
+            "/all-companies/reviews/csv": "GET - Download CSV with ALL NASDAQ companies' reviews",
+            "/batch/reviews/csv": "POST - Download CSV for specific companies (JSON body required)"
         },
-        "year": f"Reviews are filtered for year {fetcher.current_year}"
+        "year": f"Reviews are filtered for year {fetcher.current_year}",
+        "bulk_operations": {
+            "all_companies": "Downloads reviews for all ~100 NASDAQ companies (may take 30+ minutes)",
+            "batch": "Send POST with JSON body: {'symbols': ['AAPL', 'MSFT', 'GOOGL']}"
+        }
     })
 
 @app.route('/companies')
@@ -289,6 +295,196 @@ def download_company_reviews_csv(symbol):
         logger.error(f"Error generating CSV for {symbol}: {str(e)}")
         return jsonify({
             "error": f"Failed to generate CSV for {symbol}",
+            "details": str(e)
+        }), 500
+
+@app.route('/all-companies/reviews/csv')
+def download_all_companies_reviews_csv():
+    """Download reviews for ALL NASDAQ companies as one massive CSV"""
+    try:
+        all_reviews = []
+        successful_companies = []
+        failed_companies = []
+        
+        logger.info(f"Starting bulk fetch for all {len(NASDAQ_100_COMPANIES)} companies...")
+        
+        for i, (symbol, company_data) in enumerate(NASDAQ_100_COMPANIES.items(), 1):
+            try:
+                company_info = get_company_info(symbol)
+                logger.info(f"[{i}/{len(NASDAQ_100_COMPANIES)}] Fetching reviews for {symbol} - {company_info['company_name']}")
+                
+                # Fetch reviews for this company
+                company_reviews = fetcher.fetch_developer_reviews(
+                    company_info['play_store_developer'],
+                    symbol
+                )
+                
+                if company_reviews:
+                    all_reviews.extend(company_reviews)
+                    successful_companies.append(symbol)
+                    logger.info(f"✓ {symbol}: Found {len(company_reviews)} reviews")
+                else:
+                    logger.warning(f"✗ {symbol}: No reviews found")
+                    failed_companies.append(symbol)
+                
+                # Extra delay between companies to be respectful
+                time.sleep(2.0)
+                
+            except Exception as e:
+                logger.error(f"✗ {symbol}: Error - {str(e)}")
+                failed_companies.append(symbol)
+                continue
+        
+        if not all_reviews:
+            return jsonify({
+                "message": f"No reviews found for any company in {fetcher.current_year}",
+                "attempted_companies": len(NASDAQ_100_COMPANIES),
+                "successful": len(successful_companies),
+                "failed": len(failed_companies)
+            }), 404
+        
+        # Create DataFrame
+        df = pd.DataFrame(all_reviews)
+        
+        # Reorder columns
+        column_order = [
+            'company_symbol', 'developer_name', 'app_id', 'app_title',
+            'review_date', 'score', 'review_text', 'reviewer_name',
+            'helpful_count', 'review_id'
+        ]
+        df = df.reindex(columns=column_order)
+        
+        # Sort by company symbol then date for better organization
+        df = df.sort_values(['company_symbol', 'review_date'])
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv', encoding='utf-8') as tmp_file:
+            df.to_csv(tmp_file.name, index=False, encoding='utf-8')
+            tmp_filename = tmp_file.name
+        
+        # Generate filename
+        filename = f"nasdaq_100_all_reviews_{fetcher.current_year}.csv"
+        
+        logger.info(f"Successfully generated CSV with {len(all_reviews)} total reviews from {len(successful_companies)} companies")
+        
+        return send_file(
+            tmp_filename,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='text/csv'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error generating bulk CSV: {str(e)}")
+        return jsonify({
+            "error": "Failed to generate bulk CSV for all companies",
+            "details": str(e)
+        }), 500
+
+@app.route('/batch/reviews/csv', methods=['POST'])
+def download_batch_companies_reviews_csv():
+    """Download reviews for a specific list of companies as CSV
+    
+    POST body should be JSON: {"symbols": ["AAPL", "MSFT", "GOOGL"]}
+    """
+    try:
+        data = request.get_json()
+        if not data or 'symbols' not in data:
+            return jsonify({
+                "error": "Request must include 'symbols' array in JSON body",
+                "example": {"symbols": ["AAPL", "MSFT", "GOOGL"]}
+            }), 400
+        
+        symbols = data['symbols']
+        if not isinstance(symbols, list) or len(symbols) == 0:
+            return jsonify({
+                "error": "Symbols must be a non-empty array"
+            }), 400
+        
+        all_reviews = []
+        successful_companies = []
+        failed_companies = []
+        
+        logger.info(f"Starting batch fetch for {len(symbols)} companies: {symbols}")
+        
+        for i, symbol in enumerate(symbols, 1):
+            try:
+                company_info = get_company_info(symbol.upper())
+                if not company_info:
+                    failed_companies.append(symbol)
+                    logger.warning(f"✗ {symbol}: Company not found")
+                    continue
+                
+                logger.info(f"[{i}/{len(symbols)}] Fetching reviews for {symbol} - {company_info['company_name']}")
+                
+                # Fetch reviews for this company
+                company_reviews = fetcher.fetch_developer_reviews(
+                    company_info['play_store_developer'],
+                    symbol.upper()
+                )
+                
+                if company_reviews:
+                    all_reviews.extend(company_reviews)
+                    successful_companies.append(symbol.upper())
+                    logger.info(f"✓ {symbol}: Found {len(company_reviews)} reviews")
+                else:
+                    logger.warning(f"✗ {symbol}: No reviews found")
+                    failed_companies.append(symbol.upper())
+                
+                # Delay between companies
+                time.sleep(1.5)
+                
+            except Exception as e:
+                logger.error(f"✗ {symbol}: Error - {str(e)}")
+                failed_companies.append(symbol)
+                continue
+        
+        if not all_reviews:
+            return jsonify({
+                "message": f"No reviews found for any of the requested companies in {fetcher.current_year}",
+                "requested_symbols": symbols,
+                "successful": successful_companies,
+                "failed": failed_companies
+            }), 404
+        
+        # Create DataFrame
+        df = pd.DataFrame(all_reviews)
+        
+        # Reorder columns
+        column_order = [
+            'company_symbol', 'developer_name', 'app_id', 'app_title',
+            'review_date', 'score', 'review_text', 'reviewer_name',
+            'helpful_count', 'review_id'
+        ]
+        df = df.reindex(columns=column_order)
+        
+        # Sort by company symbol then date
+        df = df.sort_values(['company_symbol', 'review_date'])
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv', encoding='utf-8') as tmp_file:
+            df.to_csv(tmp_file.name, index=False, encoding='utf-8')
+            tmp_filename = tmp_file.name
+        
+        # Generate filename
+        symbols_str = "_".join(successful_companies[:5])  # Limit filename length
+        if len(successful_companies) > 5:
+            symbols_str += f"_and_{len(successful_companies)-5}_more"
+        filename = f"batch_{symbols_str}_reviews_{fetcher.current_year}.csv"
+        
+        logger.info(f"Successfully generated batch CSV with {len(all_reviews)} total reviews from {len(successful_companies)} companies")
+        
+        return send_file(
+            tmp_filename,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='text/csv'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error generating batch CSV: {str(e)}")
+        return jsonify({
+            "error": "Failed to generate batch CSV",
             "details": str(e)
         }), 500
 
