@@ -1,7 +1,3 @@
-# ================================
-# SETUP INSTRUCTIONS
-# ================================
-
 ## Installation
 
 1. Clone or create your project directory
