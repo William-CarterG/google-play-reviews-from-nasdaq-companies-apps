@@ -13,6 +13,10 @@ import tempfile
 import logging
 from typing import List, Dict, Any
 import re
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor
+import csv
 
 # Import NASDAQ companies data
 from nasdaq_companies import NASDAQ_100_COMPANIES, get_company_info
@@ -24,12 +28,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class PlayStoreReviewsFetcher:
-    def __init__(self, rate_limit_delay: float = 1.0):
+    def __init__(self, rate_limit_delay: float = 0.0):
         """
         Initialize the reviews fetcher
         
         Args:
-            rate_limit_delay: Delay between requests in seconds
+            rate_limit_delay: Delay between requests in seconds (0 = no delay)
         """
         self.rate_limit_delay = rate_limit_delay
         self.current_year = datetime.now().year
@@ -69,29 +73,32 @@ class PlayStoreReviewsFetcher:
     
     def fetch_app_reviews(self, app_id: str, app_title: str = None) -> List[Dict[str, Any]]:
         """
-        Fetch all 2025 reviews for a specific app
+        Fetch up to 2000 most recent reviews from 2025 for a specific app
         
         Args:
             app_id: Google Play Store app ID
             app_title: App title for logging purposes
             
         Returns:
-            List of review dictionaries
+            List of review dictionaries (max 2000)
         """
         try:
             logger.info(f"Fetching reviews for app: {app_title or app_id}")
             
-            # Fetch all reviews for the app
+            # Fetch all reviews with no rate limiting
             app_reviews = reviews_all(
                 app_id,
-                sleep_milliseconds=int(self.rate_limit_delay * 1000),
-                lang='en',  # You can modify this or make it configurable
-                country='us'  # You can modify this or make it configurable
+                sleep_milliseconds=0,  # No rate limiting
+                lang='en',
+                country='us'
             )
+            
+            # Limit to first 2000 reviews (most recent) since count parameter doesn't work
+            limited_reviews = app_reviews[:2000]
             
             # Filter reviews from current year (2025)
             current_year_reviews = []
-            for review in app_reviews:
+            for review in limited_reviews:
                 review_date = review.get('at')
                 if review_date and review_date.year == self.current_year:
                     # Structure the review data
@@ -148,13 +155,183 @@ class PlayStoreReviewsFetcher:
             
             all_reviews.extend(app_reviews)
             
-            # Rate limiting between apps
-            time.sleep(self.rate_limit_delay)
+            # Remove rate limiting between apps
+            # time.sleep(self.rate_limit_delay)  # Eliminated!
         
-        return all_reviews
+    def fetch_company_reviews_worker(self, symbol: str, reviews_queue: queue.Queue, progress_queue: queue.Queue):
+        """
+        Worker function to fetch reviews for a single company (thread-safe)
+        
+        Args:
+            symbol: NASDAQ symbol
+            reviews_queue: Queue to put review data
+            progress_queue: Queue to put progress updates
+        """
+        try:
+            company_info = get_company_info(symbol)
+            if not company_info:
+                progress_queue.put(('error', symbol, f"Company {symbol} not found"))
+                return
+            
+            progress_queue.put(('start', symbol, f"Starting {company_info['company_name']}"))
+            
+            # Fetch reviews for this company
+            company_reviews = self.fetch_developer_reviews(
+                company_info['play_store_developer'],
+                symbol
+            )
+            
+            if company_reviews:
+                # Put reviews into queue for writing
+                for review in company_reviews:
+                    reviews_queue.put(review)
+                
+                progress_queue.put(('success', symbol, f"Completed {symbol}: {len(company_reviews)} reviews"))
+            else:
+                progress_queue.put(('warning', symbol, f"No reviews found for {symbol}"))
+                
+        except Exception as e:
+            progress_queue.put(('error', symbol, f"Error processing {symbol}: {str(e)}"))
 
-# Initialize the fetcher
-fetcher = PlayStoreReviewsFetcher(rate_limit_delay=1.5)
+    def csv_writer_worker(self, reviews_queue: queue.Queue, progress_queue: queue.Queue, csv_file_path: str, stop_event: threading.Event):
+        """
+        Dedicated thread to write reviews to CSV as they come in
+        
+        Args:
+            reviews_queue: Queue containing review dictionaries
+            progress_queue: Queue for progress updates  
+            csv_file_path: Path to CSV file
+            stop_event: Event to signal when to stop
+        """
+        try:
+            with open(csv_file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                column_order = [
+                    'company_symbol', 'developer_name', 'app_id', 'app_title',
+                    'review_date', 'score', 'review_text', 'reviewer_name',
+                    'helpful_count', 'review_id'
+                ]
+                
+                writer = csv.DictWriter(csvfile, fieldnames=column_order)
+                writer.writeheader()
+                
+                total_written = 0
+                
+                while not stop_event.is_set() or not reviews_queue.empty():
+                    try:
+                        # Get review with timeout to check stop_event periodically
+                        review = reviews_queue.get(timeout=1.0)
+                        writer.writerow(review)
+                        csvfile.flush()  # Ensure data is written immediately
+                        total_written += 1
+                        
+                        # Progress update every 100 reviews
+                        if total_written % 100 == 0:
+                            progress_queue.put(('csv_progress', 'writer', f"Written {total_written} reviews to CSV"))
+                        
+                        reviews_queue.task_done()
+                        
+                    except queue.Empty:
+                        continue  # Check stop_event and try again
+                        
+                progress_queue.put(('csv_complete', 'writer', f"CSV writing complete: {total_written} total reviews"))
+                
+        except Exception as e:
+            progress_queue.put(('error', 'csv_writer', f"CSV writer error: {str(e)}"))
+
+    def fetch_all_companies_parallel(self, max_workers: int = 4) -> tuple:
+        """
+        Fetch reviews for all NASDAQ companies using parallel processing with streaming CSV
+        
+        Args:
+            max_workers: Number of parallel threads
+            
+        Returns:
+            tuple: (csv_file_path, successful_companies, failed_companies, total_reviews)
+        """
+        # Create queues for thread communication
+        reviews_queue = queue.Queue()
+        progress_queue = queue.Queue()
+        
+        # Create temporary CSV file
+        tmp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv', encoding='utf-8')
+        csv_file_path = tmp_file.name
+        tmp_file.close()  # Close so CSV writer can open it
+        
+        # Event to signal CSV writer to stop
+        stop_event = threading.Event()
+        
+        successful_companies = []
+        failed_companies = []
+        
+        # Start CSV writer thread
+        csv_writer_thread = threading.Thread(
+            target=self.csv_writer_worker,
+            args=(reviews_queue, progress_queue, csv_file_path, stop_event)
+        )
+        csv_writer_thread.start()
+        
+        try:
+            # Start parallel company processing
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all companies to thread pool
+                future_to_symbol = {
+                    executor.submit(self.fetch_company_reviews_worker, symbol, reviews_queue, progress_queue): symbol
+                    for symbol in NASDAQ_100_COMPANIES.keys()
+                }
+                
+                completed_companies = 0
+                total_companies = len(NASDAQ_100_COMPANIES)
+                
+                # Process results as they complete
+                for future in future_to_symbol:
+                    symbol = future_to_symbol[future]
+                    try:
+                        future.result()  # This will raise any exception that occurred
+                        completed_companies += 1
+                        
+                        # Process any progress messages
+                        while not progress_queue.empty():
+                            try:
+                                msg_type, msg_symbol, message = progress_queue.get_nowait()
+                                if msg_type == 'success':
+                                    successful_companies.append(msg_symbol)
+                                elif msg_type in ['error', 'warning']:
+                                    failed_companies.append(msg_symbol)
+                                
+                                logger.info(f"[{completed_companies}/{total_companies}] {message}")
+                                
+                            except queue.Empty:
+                                break
+                        
+                    except Exception as e:
+                        logger.error(f"Thread for {symbol} failed: {str(e)}")
+                        failed_companies.append(symbol)
+        
+        finally:
+            # Signal CSV writer to stop and wait for completion
+            stop_event.set()
+            csv_writer_thread.join(timeout=30)  # Wait up to 30 seconds
+            
+            # Process any remaining progress messages
+            while not progress_queue.empty():
+                try:
+                    msg_type, msg_symbol, message = progress_queue.get_nowait()
+                    logger.info(f"Final: {message}")
+                except queue.Empty:
+                    break
+        
+        # Count total reviews by reading the CSV (quick way to get accurate count)
+        total_reviews = 0
+        try:
+            with open(csv_file_path, 'r', encoding='utf-8') as f:
+                total_reviews = sum(1 for line in f) - 1  # Subtract header
+        except:
+            pass
+        
+        return csv_file_path, successful_companies, failed_companies, total_reviews
+
+# Initialize the fetcher with no rate limiting
+fetcher = PlayStoreReviewsFetcher(rate_limit_delay=0.0)
 
 @app.route('/')
 def home():
@@ -300,84 +477,41 @@ def download_company_reviews_csv(symbol):
 
 @app.route('/all-companies/reviews/csv')
 def download_all_companies_reviews_csv():
-    """Download reviews for ALL NASDAQ companies as one massive CSV"""
+    """Download reviews for ALL NASDAQ companies using parallel processing with streaming CSV"""
     try:
-        all_reviews = []
-        successful_companies = []
-        failed_companies = []
+        logger.info(f"Starting parallel bulk fetch for all {len(NASDAQ_100_COMPANIES)} companies...")
         
-        logger.info(f"Starting bulk fetch for all {len(NASDAQ_100_COMPANIES)} companies...")
+        # Use parallel processing with streaming CSV
+        csv_file_path, successful_companies, failed_companies, total_reviews = fetcher.fetch_all_companies_parallel(max_workers=4)
         
-        for i, (symbol, company_data) in enumerate(NASDAQ_100_COMPANIES.items(), 1):
-            try:
-                company_info = get_company_info(symbol)
-                logger.info(f"[{i}/{len(NASDAQ_100_COMPANIES)}] Fetching reviews for {symbol} - {company_info['company_name']}")
-                
-                # Fetch reviews for this company
-                company_reviews = fetcher.fetch_developer_reviews(
-                    company_info['play_store_developer'],
-                    symbol
-                )
-                
-                if company_reviews:
-                    all_reviews.extend(company_reviews)
-                    successful_companies.append(symbol)
-                    logger.info(f"✓ {symbol}: Found {len(company_reviews)} reviews")
-                else:
-                    logger.warning(f"✗ {symbol}: No reviews found")
-                    failed_companies.append(symbol)
-                
-                # Extra delay between companies to be respectful
-                time.sleep(2.0)
-                
-            except Exception as e:
-                logger.error(f"✗ {symbol}: Error - {str(e)}")
-                failed_companies.append(symbol)
-                continue
-        
-        if not all_reviews:
+        if total_reviews == 0:
+            os.unlink(csv_file_path)  # Clean up empty file
             return jsonify({
                 "message": f"No reviews found for any company in {fetcher.current_year}",
                 "attempted_companies": len(NASDAQ_100_COMPANIES),
                 "successful": len(successful_companies),
-                "failed": len(failed_companies)
+                "failed": len(failed_companies),
+                "failed_companies": failed_companies
             }), 404
         
-        # Create DataFrame
-        df = pd.DataFrame(all_reviews)
-        
-        # Reorder columns
-        column_order = [
-            'company_symbol', 'developer_name', 'app_id', 'app_title',
-            'review_date', 'score', 'review_text', 'reviewer_name',
-            'helpful_count', 'review_id'
-        ]
-        df = df.reindex(columns=column_order)
-        
-        # Sort by company symbol then date for better organization
-        df = df.sort_values(['company_symbol', 'review_date'])
-        
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv', encoding='utf-8') as tmp_file:
-            df.to_csv(tmp_file.name, index=False, encoding='utf-8')
-            tmp_filename = tmp_file.name
-        
         # Generate filename
-        filename = f"nasdaq_100_all_reviews_{fetcher.current_year}.csv"
+        filename = f"nasdaq_100_all_reviews_{fetcher.current_year}_parallel.csv"
         
-        logger.info(f"Successfully generated CSV with {len(all_reviews)} total reviews from {len(successful_companies)} companies")
+        logger.info(f"Parallel processing complete: {total_reviews} total reviews from {len(successful_companies)} companies")
+        logger.info(f"Successful: {successful_companies}")
+        logger.info(f"Failed: {failed_companies}")
         
         return send_file(
-            tmp_filename,
+            csv_file_path,
             as_attachment=True,
             download_name=filename,
             mimetype='text/csv'
         )
         
     except Exception as e:
-        logger.error(f"Error generating bulk CSV: {str(e)}")
+        logger.error(f"Error in parallel bulk CSV generation: {str(e)}")
         return jsonify({
-            "error": "Failed to generate bulk CSV for all companies",
+            "error": "Failed to generate parallel bulk CSV for all companies",
             "details": str(e)
         }), 500
 
@@ -431,8 +565,7 @@ def download_batch_companies_reviews_csv():
                     logger.warning(f"✗ {symbol}: No reviews found")
                     failed_companies.append(symbol.upper())
                 
-                # Delay between companies
-                time.sleep(1.5)
+                # Removed delay between companies for speed
                 
             except Exception as e:
                 logger.error(f"✗ {symbol}: Error - {str(e)}")
